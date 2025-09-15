@@ -1,0 +1,275 @@
+
+•	M-Sim
+o	Trace-driven simulation
+o	No actual computation is performed in producing address or data
+o	Trace of instructions pre-generated with all info ready for simulation
+	Memory address for L/S
+	Next PC (branch T/NT already known in trace)
+o	Simulation-time dependent
+	TLB/Cache/memory hit/miss and delay 
+	Branch prediction outcome (T/NT) from the predictor
+	Roll back due to mis-prediction, traps, interrupts
+o	Memory Organization
+	TLB – table look-aside buffer
+	 iL1/dL1, L2, & MM
+
+===================================================================================
+•	Start with sim_outorder.c
+•	Sim_main()
+o	Fast forward: to populate cache/memory, and branch predictor table; each thread gets the same number of instructions to execute without going through the M-sim microarchitecture – no queues are populated, no policies are imposed, no stats are collected
+o	Reversed-stage simulation – each cc 6 stages are simulated in reversed order to ensure proper pipelining transition; if not, extra buffer is required for each stage to prevent overwriting and one-cc-pass-through-all-stages
+	Commit
+	Cores.update_fu + writeback
+	Lsq_refresh + wakeup + selection + execute
+	Dispatch
+	Register_rename
+	Fetch 
+•	Fetch
+o	Fetch instructions from cache/memory into thread’s own IFQ
+o	Default set to i-Count policy:
+	Priority based on # of instructions in IFQ and ROB
+	At most 2 threads, each thread gets at most half of fetch bandwidth per cc
+•	Register_rename
+o	Rename Registers
+	Rename instructions from IFQ into ROB in round-robin
+	# per cc = decode bandwidth (??)
+	ROB:
+•	Head: oldest instruction
+•	Tail: next empty location after the newest instruction
+	The ROB entry with a destination register has an attribute storing its respective “old” register (the very previous co-WAW one)
+	Each thread has an arch_register-indexed “rename_table” array, each entry of which stores the “most recent” physical register mapped by the arch register
+	Each register is in one of the 4 states:
+•	Free – not allocated (“architectural” state becomes “free” when the next co-WAW instruction is committed)
+•	Allocated – when renamed and allocated to one instruction
+•	Write Back – when instruction is done execution and is back to ROB waiting to be committed; result written back to this physical register for instructions yet to rename to read
+•	Architectural – when instruction is committed; this register becomes the “architectural” one – the value to save when interrupted (context switching)
+o	If (IFQ empty) or (ROB full) or (LSQ full) or (fetch_rename delay not satisfied) or (rename_dispatch delay not satisfied)
+then erase thread for current sim_cc
+else rename register (integer vs floating point) if free register found
+	If branch 
+•	Update BTB
+•	If mis-predicted (known in trace)
+•	set context in spec mode (what for??)
+•	set recover_PC
+	If L/S instruction
+•	Put ea_comp (address calculation) portion into ROB
+•	Put L/S portion into LSQ to be issued once ea_comp is done (and operand ready)
+•	Dispatch
+o	Dispatch from ROB into a shared IQ (in-order now; can be modified to be out-of-order?)
+o	When operands ready -> put into ready queue (RQ); otherwise put into wait queue (WQ)
+o	Store instructions are put into RQ as well here when ea and source register are ready (loads put into RQ by lsq_refresh)
+
+•	Lsq_refresh + wakeup + selection + execute (Execute Stage)
+o	Lsq_refresh
+•	Sweep through LSQ for “ready loads”
+	No load speculation – LSQ refresh in every cc; stops at the first “unresolved” store (its effective address is not yet determined/resolved)
+	Non-speculative loads are sent to RQ for OOO execution (store instructions are put into RQ by “Dispatch” – see dispatch)
+	If (store)
+If (addr not ready) break; /* no load speculation */
+Else 	if (data not ready) put addr in UKQ  
+/* “store data (STD) unknown queue” to be matched and erased later once data known*/
+Else erase addr from UKQ /* one placed in UKQ in earlier */
+		If (load) 
+and (dispatched) and (not issued) and (not queued) and (not completed) and (operands ready)
+if (no match in UKQ) /* otherwise, need to wait for store data for “store forwarding” */
+place in RQ
+•	Note: A later STD known (store B) “hides” an earlier STD unknown (store A) (when they are the same address):  similar to register WAW hazard, data to be stored by A can still be used for any load with same address as A, as long as they are before B.  Storing by B will be the eventual store. No need to for A to store any more, thus it can be removed from UKQ.
+
+o	Wakeup 
+	When instructions are ready in WQ, put into RQ
+	Sweep through each instruction in WQ to inspect for operand readiness
+•	Insert in RQ in Priority: (oldest first)
+1.	Memory and long latency operations 
+2.	Branch
+3.	others 
+o	Selection
+	Remove the instructions in RQ to issue 
+	If store instruction
+Consider it issued and completed, send result to LSQ for commit
+else 
+       issue into a function unit (FU) if available
+       set FU release time
+       If load instruction
+o	scan through LSQ for matching store address 
+	if (match) “store forward” (load latency =1)
+	else determine cache hit/miss and calculate cache latency
+o	load latency prediction??
+•	All loads and stores also check TLB for latency 
+	Place them in issue_exec_q (IEQ) with ISSUE_EXEC_DELAY
+o	Execute
+	Take instructions out of the IEQ and begin their execution; schedule a writeback event (place into eventq)
+	remove from RQ and IQ
+•	Cores.update_fu + writeback (WriteBack stage)
+o	Cores.update_fu (in cmp.c)
+	Reduce busy time of in-use functional units by 1 cycle
+o	Writeback
+	Get the next instruction from the core’s eventq
+	If with a destination register
+•	Mark destination physical register state as writeback REG_WB (from REG_ALLOC)
+•	Note: in hardware, this data should be forwarded to ROB and WQ; in simulator, operand readiness is scanned again in “Wakeup” by checking the source_phys_reg state (WB state?) through the rename _table
+	If mis-prediction (indicated by rs->recover_instr)
+•	Call roolbackto (in cmp.c)
+•	Update branch predictor BTB (again??)
+•	Commit
+o	Commit from head of ROB
+o	If ea calculation for L/S
+	Retire corresponding LSQ entry as well
+	If store
+•	If WB “full”
+•	Remove entries in WB with write_finish_time < current sim_cc (M-Sim does not update WB in every cc, but instead only remove such entries when there is a store commit and WB is “full”
+•	If WB is not full and store port available 
+•	Calculate latency and commit into write buffer in finish-time order 
+•	Note: TLB (Translation Lookaside Buffer) for virtual memory (VM) page translation.  Current version does not (?) implement VM, thus TLB accesses are always considered hits (with a latency =1)?
+o	If branch 
+	Update branch predictor BTB
+o	If with destination register
+	Free old register -> change old register state to REG_FREE (from REG_ARCH)
+	Change this register state to REG_ARCH (from REG_ALLOC)
+=====================================================================================
+•	Instruction definition:
+o	Registers: out1, out2, in1, in2, in3
+o	Target_PC: actual next/target PC
+o	ROB_entry 	*ls, *lsq  /* ROB and LSQ entries share the same data structure */
+
+•	Instruction count in queues:
+o	fetch_num: number of valid entries in IFQ
+o	ROB_num: number of valid entries in ROB
+o	LSQ_num: number of valid entries in LSQ
+
+•	Inter-stage delay:
+o	FETCH_RENAME_DEALY: # of cc required for a fetch to complete in IFQ for the instruction to be ready for rename
+o	RENAME_DISPATCH_DELAY: # of cc required for a rename to complete in ROB for the instruction to be ready for dispatch
+o	ISSUE_EXEC_DELAY: # of cc required for an issue to complete in IQ/RQ for the instruction to be ready for issue
+
+•	ROB structure: when renaming a new instruction into ROB
+o	Place at tail location
+o	Slip = sim_cycle-1??
+o	Op; PC; next_PC; pred_PC:  PC and next PC and predicted PC
+o	In_LSQ; LSQ_index: in LSQ? If so, which entry
+o	ea_comp: ea comp?
+o	recover_instr: to rollback?
+o	dir_update: to change direction after miss prediction?
+o	progress status
+	Dispatched
+	In_IQ
+	Queued (in RQ)
+	Issued
+	Completed (WB)
+o	Src_physreg[0/1]: Obtain source register physical register index from rename table
+o	regs_index: physical register index for destination if w/ destination register???
+o	L1_miss; L2_miss; L3_miss
+o	iq_entry_num: iq entry index after dispatched
+o	physreg: physical register index for destination if w/ destination register
+o	old_physreg: the very last co-WAW instruction’s destination register index
+
+•	LSQ structure: Same as ROB
+•	Rename table (RT):
+o	Each thread has a RT with 32 (arch register) indexed entries, each storing the index of physical register used by the most recent instruction’s destination register
+o	Every time a new instruction with an arch register as its destination is renamed, that corresponding entry in RT is updated/modified, and its old value is store in “old_physreg” of this instruction in ROB
+o	RT is used for data forwarding to resolve WAW hazards: instructions requiring source values can use RT to locate its source physical registers.
+o	RT is also needed in releasing a physical register: when an instruction is committed, its old_physreg will be freed.
+o	RT is also needed for rollback: rollback of wrongly speculated instructions starts from the newest instruction, and going backward, continue to copy back the old_physreg value recursively. 
+
+•	Assert – to check if a coding error happens
+•	Rollback
+o	Happens when miss prediction and other speculative operations(??)
+o	In rollbackto() in cmp.c
+	Rollback instructions from ROB  until branch
+•	Also from LSQ if ea calculation
+•	Perform memory rollback
+	Store (why needs rollback???)
+	Load – any changes (replacement) to cache due to cache miss will not roll back
+•	Squash ROB entry; Squash all IFQ entries??
+•	If in IQ, free IQ entry
+•	If w/ destination register 
+•	Release physical register -> change state to REG_FREE
+•	Rollback rename table -> set it to old_physreg (recursively if needed)
+
+•	Cache/Memory 
+o	TLB???
+	iTLB: 16 sets, b=4096B, S=4, LRU, miss latency=30??
+	dTLB: 32 sets, b=4096B, S=4, LRU, miss latency=30??
+o	L1 cache
+	il1: 512 sets, b=64B, S=2, LRU, latency =1
+	dl1: 256 sets, b=64B, S=4, LRU, latency =1
+o	L2 cache
+	ul2: 512 sets, b=64B, S=16, LRU, latency =10
+o	Memory
+	Latency=300
+o	Memory Read vs. Memory Write
+	Read: L1 hit = 1cc; L2 hit=10cc; MM hit=300cc (+ bus time)
+	Write: L1 hit=1cc; L2 hit=300cc (+ bus time) due to 
+•	Write-Back between L1 and L2
+•	Write-Through between L2 and MM
+o	Memory instruction execution
+o	Memory rollback???
+	Memory instructions on??
+	Store instruction:
+•	When storing during speculation, read and save data at store location??
+
+•	Write Buffer
+o	To commit store instructions into Write Buffer (WB)
+o	Write coalesce in WB – different stores belonging to the same block is combined to one??  
+o	WB unit in “block”
+o	If cache miss  mark “action time stamp” (write finish time WFT) on the unit
+o	No “bypass” WB if WB is full, and the next incoming store is L1 hit
+o	To determine if the new incoming store is Hit or Miss:  all the “modifications” of all stores in WB are considered already taken into consideration
+o	Only when WB is “full”, and new incoming store will check if any entry with a WFT less the current cycle to decide if any entry should have been emptied
+o	Follows “bus-free” model (instead of “bus-contention”): each write takes only 1 cc of bus time (plus the cache/memory access time, plus the miss penalty). “busfree” indicates the time when bus is free to handle the next write (including the 1 cc already reserved for it).  “latency” of a new write is determined as:
+	latency = max {0, replace_ready – now}, then
+	latency = max {latency, busfree-now}
+
+•	Branch Prediction
+o	Type: NT/T/Prefect/Bimod/2-Level/Combination
+o	Return address stack (ras) size default to 16
+o	Penalty (in cycles) for a branch misprediction default to 6 (for rollback?)
+o	Separate predictor for each thread/context
+
+•	Cache load latency predictor
+o	Included??
+
+Other important superscalar OOO / SMT concepts:
+•	All instruction execution is “speculative” – not only the branch instructions: alu instructions can trap; memory instructions can page fault, etc.
+•	Nested branches can be speculated as well.
+•	“Faulting” instructions (e.g. mis-predicted branch, page fault) usually wait until it is ready to commit (at ROB head) before rolling-back wrongly-speculated instructions happens. Reason: do not want to proceed with early unnecessary page fault due to load on the mis-speculated trace.
+•	Early/fast rollback exists in some modern-day CPUs
+
+=====================================================================================
+Beyond M-sim:
+•	Register capping
+o	Cap the number of integer registers used per thread
+o	 Use register counter (rc) monitoring:
+	“Rename” an instruction with a destination register  rc++
+	“Commit” an instruction with a destination register  rc—
+	Flush: in “rollbackto” (cmp.c) every instruction with a destination register rolled back  rc—
+•	Regular alu instruction rollback: needs to roll back rename_table.
+•	Store instruction rollback: needs to roll back “pre_memory”??
+o	Intelligent / adaptive capping
+	Machine learning
+•	Thread halting
+o	Alternating fetch/rename of threads when heavy load
+
+•	Load Speculation
+o	Allow load(s) past the 1st unresolved store to speculate if ready; once the store is resolved and Distinct Effective Address Confirmation (DEAC) is clear, then WB the load(s)
+o	Store forwarding? If DEAC is not true, the pass store data to load
+o	LSQ refresh: bypass address checking the 1st time for a load (marked as “spec”)
+	Send to RQ, IEQ…
+	Instead of to eventq, send it to “specq”, wait for DEAC
+o	Continue to do LSQ refresh every cc, the load marked will recheck matching
+	If match, then squash entry in specq, restart in RQ (store forwarding will take place in “selection” stage)
+	Else transfer entry from specq to eventq (schedule writeback event)
+
+o	Load Speculation Prediction
+	Continue to spec load when the last spec load is “successful”
+	Otherwise stop the spec “load” – but continue to perform “speculation” in issuing spec load without the actual “load” of which the DEAC is used to determine if next spec load should load.
+o	Prioritized Load Speculation among threads
+
+•	Victim cache
+o	Victim cache partitioning?
+o	Thread-based priority victim caching
+•	SMT-adaptive LRU 
+o	Optimize use of cache with modified LRU
+
+
+Questions:
+
