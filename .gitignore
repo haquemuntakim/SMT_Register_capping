@@ -1,0 +1,32 @@
+# Build artifacts
+build/
+bin/
+*.o
+*.exe
+*.out
+
+# Debug files
+*.dSYM/
+*.gdb_history
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Temporary files
+/tmp/
+*.tmp
+*.temp
+
+# Log files
+*.log
+
+# Core dumps
+core.*
